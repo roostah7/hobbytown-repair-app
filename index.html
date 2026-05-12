@@ -1590,8 +1590,6 @@ function render() {
 }
 
 function renderLogin() {
-  const params = new URLSearchParams(window.location.hash.replace(/^#/, '') + '&' + window.location.search.replace(/^\?/, ''));
-  const justEmailed = window._magicLinkJustSent;
   $root.innerHTML = `
     <div class="login-wrap">
       <div class="login-card">
@@ -1601,41 +1599,42 @@ function renderLogin() {
           <path fill="#fff" d="M363.49,339.96c-3.82,13.19-3.98,20.3,5.99,30.34,7.4,7.39,12.79,11.81,9.6,22.81-3.06,10.56-10.32,32.29-96.97,7.17-19.35-5.61-75.53-22.37-66.99-51.84,8.06-34.38,29.77,12.44,55.65-76.85,6.89-23.75,1.35-24.4-20.64-30.78-61.58-17.85-56.37-14.43-67.85,25.16-17.47,60.26,16.82,43.97,8.53,72.57-8.93,30.79-73.66,13.93-94.77,7.81-20.23-5.87-80.87-25.35-72.19-55.26,2.68-9.24,10.93-13.05,19.43-14.39,18-2.89,23.34.09,49.99-91.84,33.92-117,29.35-107.84,15.63-121.35-5.58-5.43-12.35-11.68-9.8-20.48,9.82-33.87,84.3-16.09,108.93-8.95,18.47,5.36,68.86,22.34,61.21,48.74-3.95,13.64-12.83,16.31-24.73,19.53-12.78,2.97-16.95,7.48-28.3,46.63-7.14,24.63,5.19,24.87,26.3,30.99l22.43,6.5c29.03,8.42,29.43,3.76,33.38-9.87,13.9-47.95,7.31-53.19,2.49-57.93-6.95-7.26-13.72-13.51-10.41-24.95,2.42-8.36,7.8-33.5,95.34-8.13,20.67,5.99,79.05,23.39,70.12,54.18-2.81,9.68-9.56,14.87-19.63,16.72-14.85,1.89-19.31-.83-39.58,69.11l-33.15,114.37Z"/>
         </svg>
         <h1 style="text-align:center">HobbyTown Repairs</h1>
-        <div class="sub" style="text-align:center">${justEmailed ? '✉️ Check your email for the sign-in link' : 'Sign in with your work email'}</div>
-        ${justEmailed ? '' : `
-          <label>Email</label>
-          <input id="email" type="email" placeholder="you@email.com" autofocus />
-          <button class="btn" id="signin">Email me a sign-in link</button>
-          <div class="demo-note" style="margin-top:var(--s-4);font-size:12px;color:var(--ink-tertiary)">No password needed. We email you a one-tap sign-in link.</div>
-        `}
-        ${justEmailed ? `
-          <button class="btn btn-secondary" id="backtologin">Use a different email</button>
-        ` : ''}
+        <div class="sub" style="text-align:center">Sign in</div>
+        <label>Email</label>
+        <input id="email" type="email" placeholder="you@email.com" autocomplete="username" autofocus />
+        <label>Password</label>
+        <input id="pwd" type="password" placeholder="••••••••" autocomplete="current-password" />
+        <button class="btn" id="signin">Sign in</button>
+        <div id="signin-err" style="display:none;margin-top:var(--s-3);color:var(--signal-danger);font-size:13px"></div>
+        <div style="margin-top:var(--s-4);font-size:12px;color:var(--ink-tertiary)">Forgot your password? Ask the shop owner to reset it.</div>
       </div>
     </div>
   `;
   const signinBtn = document.getElementById('signin');
-  if (signinBtn) signinBtn.onclick = async () => {
+  const errBox = document.getElementById('signin-err');
+  const showErr = (msg) => { errBox.textContent = msg; errBox.style.display = 'block'; };
+  const trySignIn = async () => {
     const email = document.getElementById('email').value.trim().toLowerCase();
-    if (!email || !email.includes('@')) { alert('Enter a valid email address.'); return; }
-    if (!sb) { alert('Login not ready yet — refresh the page and try again.'); return; }
+    const pwd   = document.getElementById('pwd').value;
+    if (!email || !email.includes('@')) { showErr('Enter a valid email address.'); return; }
+    if (!pwd) { showErr('Enter your password.'); return; }
+    if (!sb) { showErr('Connection not ready — refresh and try again.'); return; }
     signinBtn.disabled = true;
-    signinBtn.textContent = 'Sending…';
-    const { error } = await sb.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: window.location.origin + window.location.pathname }
-    });
+    signinBtn.textContent = 'Signing in…';
+    errBox.style.display = 'none';
+    const { error } = await sb.auth.signInWithPassword({ email, password: pwd });
     if (error) {
-      alert('Could not send sign-in link: ' + error.message);
+      showErr('Sign-in failed: ' + error.message);
       signinBtn.disabled = false;
-      signinBtn.textContent = 'Email me a sign-in link';
+      signinBtn.textContent = 'Sign in';
       return;
     }
-    window._magicLinkJustSent = email;
-    render();
+    // onAuthStateChange handler will load DB + re-render
   };
-  const backBtn = document.getElementById('backtologin');
-  if (backBtn) backBtn.onclick = () => { window._magicLinkJustSent = null; render(); };
+  signinBtn.onclick = trySignIn;
+  // Submit on Enter
+  document.getElementById('pwd').addEventListener('keydown', (e) => { if (e.key === 'Enter') trySignIn(); });
+  document.getElementById('email').addEventListener('keydown', (e) => { if (e.key === 'Enter') document.getElementById('pwd').focus(); });
 }
 
 function renderDashboard() {
