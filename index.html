@@ -7,7 +7,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&family=Caveat:wght@500&family=Lilita+One&display=swap">
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
   // Apply saved theme BEFORE first paint to avoid the bright-flash-on-load
   (function() {
@@ -788,6 +787,7 @@
         </button>
       </div>
       <span id="who-name">—</span>
+      <button id="manage-staff-btn" class="btn-secondary" style="margin-right:8px;display:none">Manage staff</button>
       <button id="changepwd" class="btn-secondary" style="margin-right:8px">Change password</button>
       <button id="logout">Sign out</button>
     </div>
@@ -795,6 +795,305 @@
 
   <div id="root"></div>
 
+<script>
+/* ============================================================
+   Inline Supabase-compatible client — no eval, no external deps.
+   Replaces @supabase/supabase-js@2 because that SDK uses Function()
+   constructors which strict-CSP browser extensions block.
+   API surface: enough to be a drop-in replacement for the calls
+   the HobbyTown app makes.
+   ============================================================ */
+(function () {
+  const SESSION_KEY = 'mini.sb.session';
+
+  function MiniSb(url, anonKey) {
+    this.url = url.replace(/\/$/, '');
+    this.anonKey = anonKey;
+    this._listeners = [];
+    try { this.session = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch (_) { this.session = null; }
+    this._installAuth();
+    this._installFunctions();
+    this._installStorage();
+  }
+
+  MiniSb.prototype._fire = function (event) {
+    for (const cb of this._listeners) { try { cb(event, { session: this.session }); } catch (e) { console.error('auth listener:', e); } }
+  };
+
+  MiniSb.prototype._authHeaders = function () {
+    const h = { 'apikey': this.anonKey, 'Content-Type': 'application/json' };
+    if (this.session && this.session.access_token) h['Authorization'] = 'Bearer ' + this.session.access_token;
+    else h['Authorization'] = 'Bearer ' + this.anonKey;
+    return h;
+  };
+
+  // Refresh the access token if it's near expiry. Returns true if refreshed.
+  MiniSb.prototype._refreshIfNeeded = async function () {
+    if (!this.session) return false;
+    const exp = this.session.expires_at || 0;
+    const now = Math.floor(Date.now() / 1000);
+    if (now < exp - 60) return false; // not yet near expiry
+    if (!this.session.refresh_token) return false;
+    if (this._refreshInFlight) { await this._refreshInFlight; return true; }
+    const self = this;
+    this._refreshInFlight = (async () => {
+      const r = await fetch(self.url + '/auth/v1/token?grant_type=refresh_token', {
+        method: 'POST',
+        headers: { 'apikey': self.anonKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: self.session.refresh_token }),
+      });
+      if (!r.ok) {
+        self.session = null;
+        try { localStorage.removeItem('mini.sb.session'); } catch (_) {}
+        self._fire('SIGNED_OUT');
+        throw new Error('Token refresh failed');
+      }
+      const data = await r.json();
+      self.session = data;
+      try { localStorage.setItem('mini.sb.session', JSON.stringify(data)); } catch (_) {}
+      self._fire('TOKEN_REFRESHED');
+    })();
+    try { await this._refreshInFlight; return true; }
+    finally { this._refreshInFlight = null; }
+  };
+
+  // fetch wrapper: tries the request, on 401 tries refresh + retry once.
+  MiniSb.prototype._authedFetch = async function (input, init) {
+    await this._refreshIfNeeded();
+    init = init || {};
+    init.headers = init.headers || this._authHeaders();
+    let r = await fetch(input, init);
+    if (r.status === 401 && this.session && this.session.refresh_token) {
+      try {
+        await this._refreshIfNeeded();
+        init.headers = this._authHeaders();
+        r = await fetch(input, init);
+      } catch (_) {}
+    }
+    return r;
+  };
+
+  MiniSb.prototype._installAuth = function () {
+    const self = this;
+    this.auth = {
+      async signInWithPassword({ email, password }) {
+        const r = await fetch(self.url + '/auth/v1/token?grant_type=password', {
+          method: 'POST',
+          headers: { 'apikey': self.anonKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await r.json();
+        if (!r.ok) return { data: null, error: { message: data.error_description || data.msg || data.error || 'Sign-in failed' } };
+        self.session = data;
+        try { localStorage.setItem(SESSION_KEY, JSON.stringify(data)); } catch (_) {}
+        self._fire('SIGNED_IN');
+        return { data: { user: data.user, session: data }, error: null };
+      },
+      async getSession() {
+        return { data: { session: self.session }, error: null };
+      },
+      async getUser() {
+        if (!self.session || !self.session.access_token) return { data: { user: null }, error: null };
+        const r = await self._authedFetch(self.url + '/auth/v1/user');
+        if (!r.ok) {
+          if (r.status === 401) {
+            self.session = null;
+            try { localStorage.removeItem(SESSION_KEY); } catch (_) {}
+          }
+          return { data: { user: null }, error: { message: 'Unauthorized' } };
+        }
+        const user = await r.json();
+        return { data: { user }, error: null };
+      },
+      async signOut() {
+        const t = self.session && self.session.access_token;
+        self.session = null;
+        try { localStorage.removeItem(SESSION_KEY); } catch (_) {}
+        if (t) {
+          try { await fetch(self.url + '/auth/v1/logout', { method: 'POST', headers: { 'apikey': self.anonKey, 'Authorization': 'Bearer ' + t } }); } catch (_) {}
+        }
+        self._fire('SIGNED_OUT');
+        return { error: null };
+      },
+      async updateUser(updates) {
+        const r = await fetch(self.url + '/auth/v1/user', {
+          method: 'PUT',
+          headers: self._authHeaders(),
+          body: JSON.stringify(updates),
+        });
+        const data = await r.json();
+        if (!r.ok) return { data: null, error: { message: data.error_description || data.msg || data.error || 'Update failed' } };
+        return { data, error: null };
+      },
+      onAuthStateChange(cb) {
+        self._listeners.push(cb);
+        return { data: { subscription: { unsubscribe: () => { self._listeners = self._listeners.filter(x => x !== cb); } } } };
+      },
+    };
+  };
+
+  MiniSb.prototype._installFunctions = function () {
+    const self = this;
+    this.functions = {
+      async invoke(name, opts) {
+        const body = (opts && opts.body) || {};
+        const r = await self._authedFetch(self.url + '/functions/v1/' + name, {
+          method: 'POST',
+          headers: self._authHeaders(),
+          body: JSON.stringify(body),
+        });
+        const txt = await r.text();
+        let data; try { data = txt ? JSON.parse(txt) : null; } catch (_) { data = txt; }
+        if (!r.ok) return { data: null, error: { message: typeof data === 'string' ? data : (data && data.message) || 'Function failed' } };
+        return { data, error: null };
+      }
+    };
+  };
+
+  MiniSb.prototype._installStorage = function () {
+    const self = this;
+    this.storage = {
+      from: (bucket) => ({
+        getPublicUrl: (path) => ({ data: { publicUrl: self.url + '/storage/v1/object/public/' + bucket + '/' + path } }),
+      }),
+    };
+  };
+
+  MiniSb.prototype.rpc = async function (fn, args) {
+    const r = await this._authedFetch(this.url + '/rest/v1/rpc/' + fn, {
+      method: 'POST',
+      headers: this._authHeaders(),
+      body: JSON.stringify(args || {}),
+    });
+    const txt = await r.text();
+    let data; try { data = txt ? JSON.parse(txt) : null; } catch (_) { data = null; }
+    if (!r.ok) return { data: null, error: { message: typeof data === 'string' ? data : (data && data.message) || 'RPC failed' } };
+    return { data, error: null };
+  };
+
+  // Realtime is replaced with a no-op chainable; polling is done in app code instead.
+  MiniSb.prototype.channel = function () {
+    const noop = { on: function () { return this; }, subscribe: function () { return this; } };
+    return noop;
+  };
+
+  MiniSb.prototype.from = function (table) {
+    return new QB(this, table);
+  };
+
+  function QB(client, table) {
+    this.client = client;
+    this.table = table;
+    this.filters = [];
+    this.selectCols = null;
+    this._single = false;
+    this._maybeSingle = false;
+    this._order = null;
+    this._action = null;
+    this._body = null;
+    this._onConflict = null;
+  }
+
+  QB.prototype.select = function (cols) { this.selectCols = cols || '*'; if (!this._action) this._action = 'select'; return this; };
+  QB.prototype.eq = function (col, val) { this.filters.push([col, 'eq', val]); return this; };
+  QB.prototype.neq = function (col, val) { this.filters.push([col, 'neq', val]); return this; };
+  QB.prototype.lte = function (col, val) { this.filters.push([col, 'lte', val]); return this; };
+  QB.prototype.gte = function (col, val) { this.filters.push([col, 'gte', val]); return this; };
+  QB.prototype.is = function (col, val) { this.filters.push([col, 'is', val]); return this; };
+  QB.prototype.in = function (col, vals) { this.filters.push([col, 'in', vals]); return this; };
+  QB.prototype.order = function (col, opts) { this._order = col + '.' + ((opts && opts.ascending === false) ? 'desc' : 'asc'); return this; };
+  QB.prototype.single = function () { this._single = true; return this; };
+  QB.prototype.maybeSingle = function () { this._maybeSingle = true; return this; };
+
+  QB.prototype.upsert = function (rows, opts) {
+    this._action = 'upsert';
+    this._body = Array.isArray(rows) ? rows : [rows];
+    this._onConflict = (opts && opts.onConflict) || null;
+    return this._exec();
+  };
+  QB.prototype.insert = function (rows) {
+    this._action = 'insert';
+    this._body = Array.isArray(rows) ? rows : [rows];
+    return this._exec();
+  };
+  QB.prototype.update = function (values) {
+    this._action = 'update';
+    this._body = values;
+    return this;
+  };
+  QB.prototype.delete = function () { this._action = 'delete'; return this; };
+
+  QB.prototype._qs = function () {
+    const ps = [];
+    for (const [col, op, val] of this.filters) {
+      if (op === 'in') {
+        const vals = val.map(v => '"' + String(v).replace(/"/g, '\\"') + '"').join(',');
+        ps.push(col + '=in.(' + vals + ')');
+      } else if (op === 'is') {
+        ps.push(col + '=is.' + (val === null ? 'null' : encodeURIComponent(val)));
+      } else {
+        ps.push(col + '=' + op + '.' + encodeURIComponent(val));
+      }
+    }
+    if (this._order) ps.push('order=' + this._order);
+    if (this._action === 'select') ps.push('select=' + encodeURIComponent(this.selectCols || '*'));
+    if (this._action === 'upsert' && this._onConflict) ps.push('on_conflict=' + encodeURIComponent(this._onConflict));
+    return ps.length ? '?' + ps.join('&') : '';
+  };
+
+  QB.prototype._exec = async function () {
+    if (!this._action) this._action = 'select';
+    const url = this.client.url + '/rest/v1/' + this.table + this._qs();
+    const headers = Object.assign({}, this.client._authHeaders());
+    let method = 'GET';
+    let body;
+    if (this._action === 'select') {
+      method = 'GET';
+    } else if (this._action === 'upsert') {
+      method = 'POST';
+      headers['Prefer'] = 'resolution=merge-duplicates,return=minimal';
+      body = JSON.stringify(this._body);
+    } else if (this._action === 'insert') {
+      method = 'POST';
+      headers['Prefer'] = 'return=minimal';
+      body = JSON.stringify(this._body);
+    } else if (this._action === 'update') {
+      method = 'PATCH';
+      headers['Prefer'] = 'return=minimal';
+      body = JSON.stringify(this._body);
+    } else if (this._action === 'delete') {
+      method = 'DELETE';
+    }
+    const r = await this.client._authedFetch(url, { method, headers, body });
+    if (!r.ok) {
+      let errText; try { errText = await r.text(); } catch (_) { errText = 'HTTP ' + r.status; }
+      let errBody; try { errBody = JSON.parse(errText); } catch (_) { errBody = { message: errText }; }
+      return { data: null, error: errBody };
+    }
+    let data = null;
+    const txt = await r.text();
+    if (txt) { try { data = JSON.parse(txt); } catch (_) { data = txt; } }
+    if ((this._single || this._maybeSingle) && Array.isArray(data)) {
+      data = data.length ? data[0] : null;
+    }
+    return { data, error: null };
+  };
+
+  // Allow `await` on the builder for select-style queries
+  QB.prototype.then = function (resolve, reject) {
+    if (!this._action) this._action = 'select';
+    return this._exec().then(resolve, reject);
+  };
+  QB.prototype.catch = function (reject) {
+    return this.then(undefined, reject);
+  };
+
+  // Expose globally so existing `window.supabase.createClient(...)` calls work
+  window.supabase = {
+    createClient: function (url, key) { return new MiniSb(url, key); }
+  };
+})();
+</script>
 <script>
 /* ============================================================
    HobbyTown RC Repair Tracker — Clickable Prototype
@@ -1232,11 +1531,7 @@ function saveDB(db) {
   // Fire-and-forget async sync to Supabase. UI keeps moving.
   pushDBToSupabase(db).catch(err => {
     console.error('Sync to Supabase failed:', err);
-    // Best-effort: surface only severe errors to the user
-    if (window._lastSyncError !== String(err)) {
-      window._lastSyncError = String(err);
-      console.warn('First sync error — UI will keep working from cache. Refresh if data looks stale.');
-    }
+    showToast('⚠ ' + (err.message || String(err)) + ' — refresh and try again', 'error');
   });
 }
 
@@ -1292,12 +1587,12 @@ async function pushDBToSupabase(db) {
   // Step 1: customers FIRST (FK target for repairs)
   if (db.customers.length) {
     const { error } = await sb.from('customers').upsert(db.customers.map(x => _scrubRow('customers', x)), { onConflict: 'id' });
-    if (error) console.error('customers upsert:', error);
+    if (error) { console.error('customers upsert:', error); throw new Error('Save failed (customers): ' + (error.message || JSON.stringify(error))); }
   }
   // Step 2: repairs (depends on customers, must come before parts/notes/labor/timers)
   if (db.repairs.length) {
     const { error } = await sb.from('repairs').upsert(db.repairs.map(x => _scrubRow('repairs', x)), { onConflict: 'id' });
-    if (error) console.error('repairs upsert:', error);
+    if (error) { console.error('repairs upsert:', error); throw new Error('Save failed (repairs): ' + (error.message || JSON.stringify(error))); }
   }
   // Step 3: parts/labor/notes/timers can run in parallel (all depend on repairs)
   const ops = [];
@@ -1311,10 +1606,19 @@ async function pushDBToSupabase(db) {
   _lastServerIds.active_timers = currentTimerIds;
   const results = await Promise.all(ops);
   for (const res of results) {
-    if (res && res.error) console.error('Upsert error:', res.error);
+    if (res && res.error) {
+      console.error('Upsert error:', res.error);
+      throw new Error('Save failed: ' + (res.error.message || JSON.stringify(res.error)));
+    }
   }
-  // Step 4: re-pull so server-assigned values (ticket numbers, defaults) flow back into the cache
-  try { await pullDBFromSupabase(); render(); } catch (e) { console.error('Post-save pull failed:', e); }
+  // Step 4: re-pull so server-assigned values (ticket numbers, defaults) flow back into the cache.
+  // Do NOT auto re-render here — the caller has just navigated to a fresh view and we'd clobber their state.
+  try {
+    const active = document.activeElement;
+    const userIsTyping = active && ['INPUT','TEXTAREA','SELECT'].includes(active.tagName);
+    await pullDBFromSupabase();
+    if (!userIsTyping) render();
+  } catch (e) { console.error('Post-save pull failed:', e); }
 }
 // The repair-policy text snapshotted on every intake so historical repairs reflect the policy IN EFFECT THEN
 const POLICY_VERSION = '2026-05-08';
@@ -1461,6 +1765,189 @@ function setUser(u) { _currentUser = u; }
 async function clearUser() { _currentUser = null; if (sb) await sb.auth.signOut(); }
 
 $logout.onclick = async () => { await clearUser(); render(); };
+
+// ============================================================
+// STAFF MANAGEMENT MODAL (owner only)
+// ============================================================
+async function openStaffModal() {
+  const u = currentUser();
+  if (!u || u.role !== 'owner') { alert('Owner only.'); return; }
+  if (!sb) { alert('Connection not ready.'); return; }
+
+  const overlay = document.createElement('div');
+  overlay.id = 'global-staff-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:var(--scrim);z-index:1000;display:flex;align-items:center;justify-content:center;padding:var(--s-4);overflow-y:auto';
+  overlay.innerHTML = `
+    <div style="background:var(--surface-1);border-radius:var(--radius-lg);padding:var(--s-5);max-width:720px;width:100%;box-shadow:var(--shadow-lg);max-height:90vh;overflow-y:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--s-3)">
+        <h2 style="margin:0">Manage staff</h2>
+        <button id="staff-close" class="btn btn-secondary">Close</button>
+      </div>
+      <div style="color:var(--ink-secondary);font-size:13px;margin-bottom:var(--s-4)">Add new staff, disable people who leave, or reset their passwords.</div>
+      <button id="staff-add-toggle" class="btn">+ Add new staff</button>
+      <div id="staff-add-form" style="display:none;margin-top:var(--s-4);background:var(--surface-2);padding:var(--s-4);border-radius:var(--radius-md);border:1px solid var(--line-soft)">
+        <label style="display:block;font-size:12px;color:var(--ink-secondary);margin-bottom:4px">Full name</label>
+        <input id="staff-add-name" type="text" placeholder="e.g. Jamie Smith" style="width:100%;padding:10px;border:1px solid var(--line-soft);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--ink-primary);margin-bottom:var(--s-3);box-sizing:border-box" />
+        <label style="display:block;font-size:12px;color:var(--ink-secondary);margin-bottom:4px">Email</label>
+        <input id="staff-add-email" type="email" placeholder="staff@email.com" style="width:100%;padding:10px;border:1px solid var(--line-soft);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--ink-primary);margin-bottom:var(--s-3);box-sizing:border-box" />
+        <label style="display:block;font-size:12px;color:var(--ink-secondary);margin-bottom:4px">Role</label>
+        <select id="staff-add-role" style="width:100%;padding:10px;border:1px solid var(--line-soft);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--ink-primary);margin-bottom:var(--s-4);box-sizing:border-box">
+          <option value="staff">Staff (can use the app)</option>
+          <option value="owner">Owner (can also manage staff)</option>
+        </select>
+        <div id="staff-add-err" style="display:none;color:var(--signal-danger);font-size:13px;margin-bottom:var(--s-3)"></div>
+        <div style="display:flex;gap:var(--s-3);justify-content:flex-end">
+          <button id="staff-add-cancel" class="btn btn-secondary">Cancel</button>
+          <button id="staff-add-save" class="btn">Create account</button>
+        </div>
+      </div>
+      <hr style="border:0;border-top:1px solid var(--line-soft);margin:var(--s-5) 0"/>
+      <div id="staff-list" style="font-size:14px">Loading staff…</div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const cleanup = () => overlay.remove();
+  document.getElementById('staff-close').onclick = cleanup;
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(); });
+
+  // Toggle add form
+  const addFormEl = document.getElementById('staff-add-form');
+  document.getElementById('staff-add-toggle').onclick = () => {
+    addFormEl.style.display = addFormEl.style.display === 'none' ? 'block' : 'none';
+    if (addFormEl.style.display === 'block') document.getElementById('staff-add-name').focus();
+  };
+  document.getElementById('staff-add-cancel').onclick = () => { addFormEl.style.display = 'none'; };
+
+  // Add-save handler
+  document.getElementById('staff-add-save').onclick = async () => {
+    const name = document.getElementById('staff-add-name').value.trim();
+    const email = document.getElementById('staff-add-email').value.trim().toLowerCase();
+    const role = document.getElementById('staff-add-role').value;
+    const errBox = document.getElementById('staff-add-err');
+    const showErr = (m) => { errBox.textContent = m; errBox.style.display = 'block'; };
+    if (!name) return showErr('Enter a name.');
+    if (!email || !email.includes('@')) return showErr('Enter a valid email.');
+    const saveBtn = document.getElementById('staff-add-save');
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Creating…';
+    errBox.style.display = 'none';
+    const { data, error } = await sb.functions.invoke('manage-staff', { body: { action: 'create', email, full_name: name, role } });
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Create account';
+    if (error || (data && data.error)) {
+      showErr('Failed: ' + ((data && data.error) || error.message || 'unknown'));
+      return;
+    }
+    addFormEl.style.display = 'none';
+    document.getElementById('staff-add-name').value = '';
+    document.getElementById('staff-add-email').value = '';
+    showCredsModal(data.email, data.password, 'New account created');
+    await loadStaffList();
+  };
+
+  // Load + render staff
+  async function loadStaffList() {
+    document.getElementById('staff-list').innerHTML = 'Loading staff…';
+    const { data, error } = await sb.functions.invoke('manage-staff', { body: { action: 'list' } });
+    if (error || (data && data.error)) {
+      document.getElementById('staff-list').innerHTML = '<div style="color:var(--signal-danger)">Failed to load: ' + ((data && data.error) || error.message) + '</div>';
+      return;
+    }
+    const me = currentUser();
+    const rows = (data.staff || []).map(s => {
+      const isSelf = s.user_id === me.id;
+      const statusBadge = s.is_active
+        ? '<span style="color:var(--signal-success);font-size:12px;font-weight:500">● Active</span>'
+        : '<span style="color:var(--ink-tertiary);font-size:12px;font-weight:500">○ Disabled</span>';
+      const roleBadge = s.role === 'owner'
+        ? '<span style="background:var(--accent-tint);color:var(--accent);font-size:11px;padding:2px 8px;border-radius:999px">Owner</span>'
+        : '<span style="background:var(--surface-sunken);color:var(--ink-secondary);font-size:11px;padding:2px 8px;border-radius:999px">Staff</span>';
+      const disableBtn = isSelf
+        ? ''
+        : (s.is_active
+          ? `<button data-act="disable" data-uid="${s.user_id}" data-name="${escapeHtml(s.full_name)}" class="btn btn-secondary" style="font-size:12px;padding:6px 10px">Disable</button>`
+          : `<button data-act="reactivate" data-uid="${s.user_id}" data-name="${escapeHtml(s.full_name)}" class="btn btn-secondary" style="font-size:12px;padding:6px 10px">Reactivate</button>`);
+      const resetBtn = `<button data-act="reset" data-uid="${s.user_id}" data-name="${escapeHtml(s.full_name)}" data-email="${escapeHtml(s.email || '')}" class="btn btn-secondary" style="font-size:12px;padding:6px 10px">Reset password</button>`;
+      const selfBadge = isSelf ? '<span style="font-size:11px;color:var(--ink-tertiary);margin-left:6px">(you)</span>' : '';
+      return `
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:var(--s-3) var(--s-3);border-bottom:1px solid var(--line-soft);gap:var(--s-3)">
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <strong>${escapeHtml(s.full_name)}</strong> ${roleBadge} ${selfBadge}
+            </div>
+            <div style="color:var(--ink-secondary);font-size:13px">${escapeHtml(s.email || '—')}</div>
+            <div style="margin-top:4px">${statusBadge}</div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+            ${resetBtn}
+            ${disableBtn}
+          </div>
+        </div>`;
+    }).join('');
+    document.getElementById('staff-list').innerHTML = rows || '<div style="color:var(--ink-tertiary)">No staff yet.</div>';
+
+    // Wire per-row actions
+    document.querySelectorAll('#staff-list button').forEach(btn => {
+      btn.onclick = async (e) => {
+        const act = btn.dataset.act;
+        const uid = btn.dataset.uid;
+        const name = btn.dataset.name;
+        const email = btn.dataset.email;
+        if (act === 'disable') {
+          if (!confirm(`Disable ${name}? They\'ll lose access immediately but their history stays in the system.`)) return;
+          btn.disabled = true; btn.textContent = 'Disabling…';
+          const { data, error } = await sb.functions.invoke('manage-staff', { body: { action: 'disable', user_id: uid } });
+          if (error || (data && data.error)) { alert('Failed: ' + ((data && data.error) || error.message)); btn.disabled = false; btn.textContent = 'Disable'; return; }
+          await loadStaffList();
+        } else if (act === 'reactivate') {
+          btn.disabled = true; btn.textContent = 'Reactivating…';
+          const { data, error } = await sb.functions.invoke('manage-staff', { body: { action: 'reactivate', user_id: uid } });
+          if (error || (data && data.error)) { alert('Failed: ' + ((data && data.error) || error.message)); btn.disabled = false; btn.textContent = 'Reactivate'; return; }
+          await loadStaffList();
+        } else if (act === 'reset') {
+          if (!confirm(`Reset password for ${name}? They\'ll need to use the new password I\'ll show you next.`)) return;
+          btn.disabled = true; btn.textContent = 'Resetting…';
+          const { data, error } = await sb.functions.invoke('manage-staff', { body: { action: 'reset_password', user_id: uid } });
+          btn.disabled = false; btn.textContent = 'Reset password';
+          if (error || (data && data.error)) { alert('Failed: ' + ((data && data.error) || error.message)); return; }
+          showCredsModal(email, data.password, `Password reset for ${name}`);
+        }
+      };
+    });
+  }
+  await loadStaffList();
+}
+
+function showCredsModal(email, password, title) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:var(--scrim);z-index:1100;display:flex;align-items:center;justify-content:center;padding:var(--s-4)';
+  overlay.innerHTML = `
+    <div style="background:var(--surface-1);border-radius:var(--radius-lg);padding:var(--s-5);max-width:480px;width:100%;box-shadow:var(--shadow-lg)">
+      <h2 style="margin:0 0 var(--s-3)">${escapeHtml(title)}</h2>
+      <div style="color:var(--ink-secondary);font-size:13px;margin-bottom:var(--s-4)">
+        Share these credentials with them privately (text, in person, etc.). They can change the password after first login. <strong>This is the only time you\'ll see this password.</strong>
+      </div>
+      <div style="background:var(--surface-2);padding:var(--s-4);border-radius:var(--radius-md);border:1px solid var(--line-soft);font-family:'JetBrains Mono', monospace;font-size:14px;margin-bottom:var(--s-4)">
+        <div style="margin-bottom:8px"><span style="color:var(--ink-secondary);font-size:11px;text-transform:uppercase;letter-spacing:0.05em">Email</span><br/>${escapeHtml(email)}</div>
+        <div><span style="color:var(--ink-secondary);font-size:11px;text-transform:uppercase;letter-spacing:0.05em">Password</span><br/><strong>${escapeHtml(password)}</strong></div>
+      </div>
+      <div style="display:flex;gap:var(--s-3);justify-content:flex-end">
+        <button id="creds-copy" class="btn btn-secondary">Copy to clipboard</button>
+        <button id="creds-close" class="btn">I\'ve saved them</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  document.getElementById('creds-close').onclick = () => overlay.remove();
+  document.getElementById('creds-copy').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(`HobbyTown Repairs login\nURL: ${window.location.origin}${window.location.pathname}\nEmail: ${email}\nPassword: ${password}`);
+      document.getElementById('creds-copy').textContent = 'Copied ✓';
+    } catch (_) {
+      document.getElementById('creds-copy').textContent = 'Copy failed — select & copy manually';
+    }
+  };
+}
+
+document.getElementById('manage-staff-btn').onclick = openStaffModal;
 
 document.getElementById('changepwd').onclick = () => {
   if (!sb) { alert('Connection not ready — refresh the page.'); return; }
@@ -1644,6 +2131,8 @@ function render() {
   }
   $topbar.classList.remove('hidden');
   $whoName.textContent = u.name + (u.role === 'owner' ? ' (Owner)' : '');
+  const manageBtn = document.getElementById('manage-staff-btn');
+  if (manageBtn) manageBtn.style.display = u.role === 'owner' ? 'inline-block' : 'none';
   if (view.name === 'dashboard') return renderDashboard();
   if (view.name === 'archive')   return renderDashboard(); // archive view reuses the dashboard renderer
   if (view.name === 'detail')    return renderDetail(view.id);
@@ -3159,6 +3648,18 @@ function renderIntake() {
 }
 
 // ---------------- Helpers ----------------
+function showToast(msg, kind) {
+  const existing = document.getElementById('global-toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.id = 'global-toast';
+  t.textContent = msg;
+  const color = kind === 'error' ? '#A8412E' : (kind === 'success' ? '#3F7D58' : '#2C5F8E');
+  t.style.cssText = 'position:fixed;top:24px;left:50%;transform:translateX(-50%);z-index:9999;background:#fff;color:' + color + ';border:1px solid ' + color + ';padding:12px 20px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.15);font-size:14px;max-width:600px;line-height:1.4;cursor:pointer;';
+  t.onclick = () => t.remove();
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), kind === 'error' ? 10000 : 4000);
+}
 function escapeHtml(s) { return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function formatPhone(p) { if (!p) return ''; return p.length===10 ? `(${p.slice(0,3)}) ${p.slice(3,6)}-${p.slice(6)}` : p; }
 function formatTime(iso) {
@@ -3271,25 +3772,38 @@ async function bootSupabase() {
     }
   });
 
-  // 4) Subscribe to realtime — when ANY row in our tables changes (from another tab/device),
-  //    re-pull + re-render. Keeps multiple staff in sync.
+  // 4) Polling-based cross-device sync (every 8 seconds).
+  //    Not as instant as websocket realtime, but reliable and CSP-friendly.
   if (_currentUser) {
     let _pullInFlight = false;
-    const onChange = async () => {
-      if (_pullInFlight) return;
+    setInterval(async () => {
+      if (_pullInFlight || !_currentUser) return;
+      // CRITICAL: never re-render while the user is typing — kills their text + focus
+      const active = document.activeElement;
+      if (active && ['INPUT','TEXTAREA','SELECT'].includes(active.tagName)) return;
+      // Don't poll-render if a modal is open (user is mid-interaction)
+      if (document.querySelector('[id^="global-"]') || document.querySelector('.modal-open')) return;
       _pullInFlight = true;
-      try { await pullDBFromSupabase(); render(); } catch (e) { console.error('Realtime pull failed:', e); }
-      finally { _pullInFlight = false; }
-    };
-    sb.channel('app-state')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'repairs' }, onChange)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'notes' }, onChange)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'parts' }, onChange)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'labor_entries' }, onChange)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'customers' }, onChange)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'active_timers' }, onChange)
-      .subscribe();
-    console.log('Supabase realtime connected');
+      try {
+        const before = JSON.stringify({
+          repairs: _dbCache.repairs.length,
+          notes: _dbCache.notes.length,
+          parts: _dbCache.parts.length,
+          timers: _dbCache.active_timers.length,
+        });
+        await pullDBFromSupabase();
+        const after = JSON.stringify({
+          repairs: _dbCache.repairs.length,
+          notes: _dbCache.notes.length,
+          parts: _dbCache.parts.length,
+          timers: _dbCache.active_timers.length,
+        });
+        if (before !== after) render();
+      } catch (e) {
+        console.error('Poll-sync failed:', e);
+      } finally { _pullInFlight = false; }
+    }, 8000);
+    console.log('Poll-sync running (8s interval)');
   }
 }
 
