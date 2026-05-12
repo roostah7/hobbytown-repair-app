@@ -1572,14 +1572,34 @@ async function pullDBFromSupabase() {
 // PostgREST requires every row in a bulk upsert array to have IDENTICAL keys.
 // Existing rows pulled from the server have all columns; freshly-created rows
 // only have the fields the app explicitly set. Normalize to the union of all
-// keys, filling missing values with null so PostgREST accepts the batch.
+// keys. For known NOT-NULL columns we substitute a sensible default instead of null.
+const _NOT_NULL_DEFAULTS = {
+  // repairs
+  reference_links: [],
+  transmitter_included: false,
+  battery_included: false,
+  charger_included: false,
+  customer_supplied_parts: false,
+  special_order_required: false,
+  service_fee: 30,
+  labor_rate: 60,
+  status: 'intake',
+  item_type: 'rc_vehicle',
+};
 function _normalizeBatch(rows) {
   if (!rows || !rows.length) return rows;
   const allKeys = new Set();
   for (const r of rows) for (const k of Object.keys(r)) allKeys.add(k);
   return rows.map(r => {
     const out = {};
-    for (const k of allKeys) out[k] = (r[k] === undefined) ? null : r[k];
+    for (const k of allKeys) {
+      const v = r[k];
+      if (v === undefined || v === null) {
+        out[k] = Object.prototype.hasOwnProperty.call(_NOT_NULL_DEFAULTS, k) ? _NOT_NULL_DEFAULTS[k] : null;
+      } else {
+        out[k] = v;
+      }
+    }
     return out;
   });
 }
@@ -1593,8 +1613,10 @@ function _scrubRow(table, row) {
     // the cache with the server-assigned ticket number.
     delete r.ticket;
   }
-  // Drop any legacy fields the prototype carried that don't exist in the DB schema
-  delete r.updated_at; // server-managed by trigger
+  // Drop server-managed timestamps so PostgREST uses DB defaults on INSERT
+  // and leaves them alone on UPDATE
+  delete r.updated_at;
+  delete r.created_at;
   return r;
 }
 
@@ -3701,6 +3723,7 @@ function renderIntake() {
       service_fee: 30, labor_rate: 60,
       ready_notified_date: null, picked_up_date: null,
       assigned_tech: currentUser().name,
+      reference_links: [],
       // Policy snapshot: store the EXACT policy text the customer agreed to,
       // so future edits to the global policy don't change historical agreements
       policy_version: POLICY_VERSION,
