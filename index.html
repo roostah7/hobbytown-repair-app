@@ -788,6 +788,7 @@
         </button>
       </div>
       <span id="who-name">—</span>
+      <button id="changepwd" class="btn-secondary" style="margin-right:8px">Change password</button>
       <button id="logout">Sign out</button>
     </div>
   </div>
@@ -1460,6 +1461,67 @@ function setUser(u) { _currentUser = u; }
 async function clearUser() { _currentUser = null; if (sb) await sb.auth.signOut(); }
 
 $logout.onclick = async () => { await clearUser(); render(); };
+
+document.getElementById('changepwd').onclick = () => {
+  if (!sb) { alert('Connection not ready — refresh the page.'); return; }
+  const u = currentUser();
+  if (!u) return;
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:var(--scrim);z-index:1000;display:flex;align-items:center;justify-content:center;padding:var(--s-4)';
+  overlay.innerHTML = `
+    <div style="background:var(--surface-1);border-radius:var(--radius-lg);padding:var(--s-5);max-width:420px;width:100%;box-shadow:var(--shadow-lg)">
+      <h2 style="margin:0 0 var(--s-2)">Change password</h2>
+      <div style="color:var(--ink-secondary);font-size:13px;margin-bottom:var(--s-4)">Signed in as ${u.email}</div>
+      <label style="display:block;font-size:12px;color:var(--ink-secondary);margin-bottom:4px">Current password</label>
+      <input id="cp-current" type="password" autocomplete="current-password" style="width:100%;padding:10px;border:1px solid var(--line-soft);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--ink-primary);margin-bottom:var(--s-3);box-sizing:border-box" />
+      <label style="display:block;font-size:12px;color:var(--ink-secondary);margin-bottom:4px">New password (at least 8 characters)</label>
+      <input id="cp-new" type="password" autocomplete="new-password" style="width:100%;padding:10px;border:1px solid var(--line-soft);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--ink-primary);margin-bottom:var(--s-3);box-sizing:border-box" />
+      <label style="display:block;font-size:12px;color:var(--ink-secondary);margin-bottom:4px">Confirm new password</label>
+      <input id="cp-confirm" type="password" autocomplete="new-password" style="width:100%;padding:10px;border:1px solid var(--line-soft);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--ink-primary);margin-bottom:var(--s-4);box-sizing:border-box" />
+      <div id="cp-err" style="display:none;color:var(--signal-danger);font-size:13px;margin-bottom:var(--s-3)"></div>
+      <div style="display:flex;gap:var(--s-3);justify-content:flex-end">
+        <button id="cp-cancel" class="btn btn-secondary">Cancel</button>
+        <button id="cp-save" class="btn">Update password</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const cleanup = () => overlay.remove();
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(); });
+  document.getElementById('cp-cancel').onclick = cleanup;
+  const errBox = document.getElementById('cp-err');
+  const showCpErr = (m) => { errBox.textContent = m; errBox.style.display = 'block'; };
+  document.getElementById('cp-current').focus();
+  document.getElementById('cp-save').onclick = async () => {
+    const cur = document.getElementById('cp-current').value;
+    const np  = document.getElementById('cp-new').value;
+    const cf  = document.getElementById('cp-confirm').value;
+    if (!cur) return showCpErr('Enter your current password.');
+    if (!np || np.length < 8) return showCpErr('New password must be at least 8 characters.');
+    if (np !== cf) return showCpErr('New passwords don\'t match.');
+    if (np === cur) return showCpErr('New password must be different from your current one.');
+    const saveBtn = document.getElementById('cp-save');
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Updating…';
+    errBox.style.display = 'none';
+    // Verify current password by attempting a sign-in (Supabase doesn't offer a direct "verify password" call)
+    const verify = await sb.auth.signInWithPassword({ email: u.email, password: cur });
+    if (verify.error) {
+      showCpErr('Current password is incorrect.');
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Update password';
+      return;
+    }
+    const { error } = await sb.auth.updateUser({ password: np });
+    if (error) {
+      showCpErr('Failed to update password: ' + error.message);
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Update password';
+      return;
+    }
+    cleanup();
+    alert('Password updated. Use your new password next time you sign in.');
+  };
+};
 
 // ---------------- Theme toggle (Normal / Warm / Dark) ----------------
 function applyTheme(name) {
@@ -2342,7 +2404,19 @@ function attachSignaturePad(canvas) {
       canvas.classList.remove('signed');
     },
     isEmpty() { return !hasInk; },
-    toDataURL() { return hasInk ? canvas.toDataURL('image/png') : null; },
+    toDataURL() {
+      if (!hasInk) return null;
+      // Composite the signature onto a white background so email-client dark-mode
+      // doesn't render dark ink on a dark background.
+      const exportCanvas = document.createElement('canvas');
+      exportCanvas.width = canvas.width;
+      exportCanvas.height = canvas.height;
+      const ex = exportCanvas.getContext('2d');
+      ex.fillStyle = '#FFFFFF';
+      ex.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+      ex.drawImage(canvas, 0, 0);
+      return exportCanvas.toDataURL('image/png');
+    },
   };
 }
 
