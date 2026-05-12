@@ -1569,6 +1569,21 @@ async function pullDBFromSupabase() {
   _lastServerIds.labor         = new Set((l.data || []).map(x => x.id));
 }
 
+// PostgREST requires every row in a bulk upsert array to have IDENTICAL keys.
+// Existing rows pulled from the server have all columns; freshly-created rows
+// only have the fields the app explicitly set. Normalize to the union of all
+// keys, filling missing values with null so PostgREST accepts the batch.
+function _normalizeBatch(rows) {
+  if (!rows || !rows.length) return rows;
+  const allKeys = new Set();
+  for (const r of rows) for (const k of Object.keys(r)) allKeys.add(k);
+  return rows.map(r => {
+    const out = {};
+    for (const k of allKeys) out[k] = (r[k] === undefined) ? null : r[k];
+    return out;
+  });
+}
+
 // Strip client-only fields and map JS table names → DB table names where they differ.
 function _scrubRow(table, row) {
   const r = { ...row };
@@ -1586,23 +1601,23 @@ function _scrubRow(table, row) {
 async function pushDBToSupabase(db) {
   // Step 1: customers FIRST (FK target for repairs)
   if (db.customers.length) {
-    const { error } = await sb.from('customers').upsert(db.customers.map(x => _scrubRow('customers', x)), { onConflict: 'id' });
+    const { error } = await sb.from('customers').upsert(_normalizeBatch(db.customers.map(x => _scrubRow('customers', x))), { onConflict: 'id' });
     if (error) { console.error('customers upsert:', error); throw new Error('Save failed (customers): ' + (error.message || JSON.stringify(error))); }
   }
   // Step 2: repairs (depends on customers, must come before parts/notes/labor/timers)
   if (db.repairs.length) {
-    const { error } = await sb.from('repairs').upsert(db.repairs.map(x => _scrubRow('repairs', x)), { onConflict: 'id' });
+    const { error } = await sb.from('repairs').upsert(_normalizeBatch(db.repairs.map(x => _scrubRow('repairs', x))), { onConflict: 'id' });
     if (error) { console.error('repairs upsert:', error); throw new Error('Save failed (repairs): ' + (error.message || JSON.stringify(error))); }
   }
   // Step 3: parts/labor/notes/timers can run in parallel (all depend on repairs)
   const ops = [];
-  if (db.parts.length) ops.push(sb.from('parts').upsert(db.parts.map(x => _scrubRow('parts', x)), { onConflict: 'id' }));
-  if (db.labor.length) ops.push(sb.from('labor_entries').upsert(db.labor.map(x => _scrubRow('labor_entries', x)), { onConflict: 'id' }));
-  if (db.notes.length) ops.push(sb.from('notes').upsert(db.notes.map(x => _scrubRow('notes', x)), { onConflict: 'id' }));
+  if (db.parts.length) ops.push(sb.from('parts').upsert(_normalizeBatch(db.parts.map(x => _scrubRow('parts', x))), { onConflict: 'id' }));
+  if (db.labor.length) ops.push(sb.from('labor_entries').upsert(_normalizeBatch(db.labor.map(x => _scrubRow('labor_entries', x))), { onConflict: 'id' }));
+  if (db.notes.length) ops.push(sb.from('notes').upsert(_normalizeBatch(db.notes.map(x => _scrubRow('notes', x))), { onConflict: 'id' }));
   const currentTimerIds = new Set(db.active_timers.map(x => x.id));
   const removedTimers = [..._lastServerIds.active_timers].filter(id => !currentTimerIds.has(id));
   if (removedTimers.length) ops.push(sb.from('active_timers').delete().in('id', removedTimers));
-  if (db.active_timers.length) ops.push(sb.from('active_timers').upsert(db.active_timers, { onConflict: 'id' }));
+  if (db.active_timers.length) ops.push(sb.from('active_timers').upsert(_normalizeBatch(db.active_timers), { onConflict: 'id' }));
   _lastServerIds.active_timers = currentTimerIds;
   const results = await Promise.all(ops);
   for (const res of results) {
@@ -2049,6 +2064,7 @@ function repairClosureDate(r) {
   }
   return null;
 }
+function isDeleted(r) { return !!r.deleted_at; }
 function isArchived(r) {
   if (r.status !== 'picked' && r.status !== 'aband') return false;
   const closureDate = repairClosureDate(r);
@@ -2135,6 +2151,7 @@ function render() {
   if (manageBtn) manageBtn.style.display = u.role === 'owner' ? 'inline-block' : 'none';
   if (view.name === 'dashboard') return renderDashboard();
   if (view.name === 'archive')   return renderDashboard(); // archive view reuses the dashboard renderer
+  if (view.name === 'deleted')   return renderDashboard(); // deleted view reuses the dashboard renderer
   if (view.name === 'detail')    return renderDetail(view.id);
   if (view.name === 'new')       return renderIntake();
   go({ name: 'dashboard' });
@@ -2209,8 +2226,13 @@ function renderDashboard() {
       (r.issue_description && r.issue_description.toLowerCase().includes(lowerQuery))
     );
   }
+  // Build the "deleted" bucket separately — these are soft-deleted, hidden everywhere except the dedicated view
+  const deletedAll = db.repairs.filter(isDeleted)
+    .sort((a,b) => (b.deleted_at || '').localeCompare(a.deleted_at || ''));
+
   // Categorize. "Needs Attention" is a CALLOUT/CLASSIFICATION across the other sections,
   // not a separate bucket — the same repair appears in BOTH Needs Attention AND its real status section.
+  const inDeleted = view.name === 'deleted';
   const inArchive = view.name === 'archive';
   const needsAttention = [];
   const inShop = [];
@@ -2218,6 +2240,7 @@ function renderDashboard() {
   const closed = [];   // recently closed (≤ 7 days)
   const archived = []; // closed > 7 days ago — hidden from main dashboard
   for (const r of repairs) {
+    if (isDeleted(r)) continue;
     if (isArchived(r)) {
       archived.push(r);
       // When a search is active OR we're viewing the archive, allow archived items into Closed
@@ -2250,7 +2273,13 @@ function renderDashboard() {
       <div class="tip-strip">
         <strong>Tip:</strong> when a customer calls, type the last 4 digits of their phone above.
       </div>
-      ${inArchive ? `
+      ${inDeleted ? `
+        <div style="margin-bottom:14px"><a href="#" id="backToDash" style="font-size:14px">&larr; Back to dashboard</a></div>
+        <div class="tip-strip callout-warn">
+          <strong>Deleted repairs.</strong> ${deletedAll.length} total. Click a repair to view it; from there you can ${currentUser().role === 'owner' ? '<strong>undelete</strong> it' : 'ask Bryce to undelete it'}.
+        </div>
+        ${section('Deleted', '', deletedAll.map(r => repairRow(db, r, new Set())))}
+      ` : inArchive ? `
         <div style="margin-bottom:14px"><a href="#" id="backToDash" style="font-size:14px">&larr; Back to dashboard</a></div>
         <div class="tip-strip callout-info">
           <strong>Archive view.</strong> Closed repairs over ${ARCHIVE_AFTER_DAYS} days old. ${archived.length} total. Search bar still works.
@@ -2269,12 +2298,19 @@ function renderDashboard() {
             <a href="#" id="viewArchive" style="font-size:13px; color:var(--muted);">📦 View ${archived.length} archived repair${archived.length===1?'':'s'} (older than ${ARCHIVE_AFTER_DAYS} days)</a>
           </div>
         ` : ''}
+        ${deletedAll.length ? `
+          <div style="text-align:center; margin-top:4px;">
+            <a href="#" id="viewDeleted" style="font-size:13px; color:var(--muted);">🗑 View ${deletedAll.length} deleted repair${deletedAll.length===1?'':'s'}</a>
+          </div>
+        ` : ''}
       `}
     </div>
   `;
   document.getElementById('newbtn').onclick = () => go({ name: 'new' });
   const $s = document.getElementById('search');
   $s.oninput = (e) => { view.search = e.target.value; renderDashboard(); $s.focus(); };
+  const delLink = document.getElementById('viewDeleted');
+  if (delLink) delLink.onclick = (e) => { e.preventDefault(); go({ name: 'deleted' }); };
   const archLink = document.getElementById('viewArchive');
   if (archLink) archLink.onclick = (e) => { e.preventDefault(); go({ name: 'archive' }); };
   const backLink = document.getElementById('backToDash');
@@ -2373,9 +2409,17 @@ function renderDetail(id) {
   const sessionsForRepair = notes.filter(n => n.note_type === 'work_session');
   const fmtMin = (m) => m >= 60 ? Math.floor(m/60) + 'h ' + (m%60?(m%60)+'m':'').trim() : (m||0) + ' min';
 
+  const meRole = currentUser() ? currentUser().role : 'staff';
+  const isOwner = meRole === 'owner';
   $root.innerHTML = `
     <div class="app">
       <a href="#" class="back-link" id="back">&larr; Back to dashboard</a>
+      ${r.deleted_at ? `
+        <div class="callout-warn" style="padding:12px 16px;border-radius:8px;margin-bottom:14px;font-size:14px;border:1px solid var(--signal-warn);background:var(--signal-warn-tint);color:var(--ink-primary)">
+          <strong>This repair is deleted.</strong> Deleted ${formatRelativeDateTime(r.deleted_at)}${r.deleted_by_name ? ' by ' + escapeHtml(r.deleted_by_name) : ''}.
+          ${isOwner ? '<button id="undeleteBtn" class="btn small" style="margin-left:12px">Restore</button>' : '<span style="color:var(--ink-secondary);margin-left:8px">Ask Bryce if you need this restored.</span>'}
+        </div>
+      ` : ''}
       <div class="detail-header">
         <div class="top">
           <h2>#${r.ticket}${c.name ? ' &middot; ' + escapeHtml(c.name) : ''}</h2>
@@ -2438,6 +2482,7 @@ function renderDetail(id) {
                 <button class="btn small" id="logCall">+ Log call</button>
                 <button class="btn small secondary" id="addNote">+ Note</button>
                 <button class="btn small secondary" id="markNotified">Mark notified</button>
+                ${!r.deleted_at ? '<button class="btn small secondary" id="deleteRepair" style="color:var(--signal-danger);border-color:var(--signal-danger);background:transparent">🗑 Delete</button>' : ''}
                 ${hiddenSystemCount > 0 ? `<button class="btn small secondary" id="toggleSystem">${showSystem ? 'Hide' : 'Show'} ${hiddenSystemCount} system event${hiddenSystemCount===1?'':'s'}</button>` : ''}
               </span>
             </h3>
@@ -2560,6 +2605,48 @@ function renderDetail(id) {
   };
   const toggleSysBtn = document.getElementById('toggleSystem');
   if (toggleSysBtn) toggleSysBtn.onclick = () => { view.showSystemNotes = !view.showSystemNotes; renderDetail(id); };
+
+  const deleteBtn = document.getElementById('deleteRepair');
+  if (deleteBtn) deleteBtn.onclick = async () => {
+    const r2 = loadDB().repairs.find(x => x.id === id);
+    if (!r2) return;
+    // First confirm
+    if (!confirm(`Delete repair #${r2.ticket} (${r2.item_description || 'no description'})?\n\nThis moves it to the Deleted section.`)) return;
+    // Second confirm — bigger warning
+    if (!confirm(`⚠ ARE YOU SURE?\n\nThis is a real customer record. Notes, parts, signature, and work history will all be hidden from the dashboard.\n\nIt CAN be restored by Bryce — but you should be very sure before deleting.\n\nProceed?`)) return;
+    const db2 = loadDB();
+    const rr = db2.repairs.find(x => x.id === id);
+    rr.deleted_at = nowISO();
+    rr.deleted_by_name = currentUser().name;
+    db2.notes.push({
+      id: uid(), repair_id: id, note_type: 'internal',
+      body: `Repair deleted by ${currentUser().name}.`,
+      author_name: currentUser().name, created_at: nowISO(),
+    });
+    saveDB(db2);
+    showToast('Repair #' + rr.ticket + ' deleted', 'success');
+    go({ name: 'dashboard' });
+  };
+
+  const undeleteBtn = document.getElementById('undeleteBtn');
+  if (undeleteBtn) undeleteBtn.onclick = async () => {
+    const r2 = loadDB().repairs.find(x => x.id === id);
+    if (!r2) return;
+    if (currentUser().role !== 'owner') { alert('Owner only.'); return; }
+    if (!confirm(`Restore repair #${r2.ticket}? It'll reappear in the dashboard.`)) return;
+    const db2 = loadDB();
+    const rr = db2.repairs.find(x => x.id === id);
+    rr.deleted_at = null;
+    rr.deleted_by_name = null;
+    db2.notes.push({
+      id: uid(), repair_id: id, note_type: 'internal',
+      body: `Repair restored from deleted by ${currentUser().name}.`,
+      author_name: currentUser().name, created_at: nowISO(),
+    });
+    saveDB(db2);
+    showToast('Repair #' + rr.ticket + ' restored', 'success');
+    renderDetail(id);
+  };
   document.getElementById('logCall').onclick    = () => openNoteModal(id, 'outbound_call');
   document.getElementById('addNote').onclick    = () => openNoteModal(id, 'internal');
   document.getElementById('markNotified').onclick = () => {
