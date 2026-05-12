@@ -3434,12 +3434,12 @@ function partCard(p) {
     <div class="part">
       <div class="top">
         <div>
-          <div class="name">${escapeHtml(p.name)}</div>
+          <div class="name">${escapeHtml(p.name)}${p.part_number ? ` <span style="color:var(--ink-secondary);font-weight:400;font-family:'JetBrains Mono', monospace;font-size:13px">${escapeHtml(p.part_number)}</span>` : ''}</div>
           <div class="sub">${sourceLabel}${p.vendor ? ' · ' + escapeHtml(p.vendor) : ''}</div>
         </div>
         ${badge}
       </div>
-      <div class="sub">Cost $${(p.cost||0).toFixed(2)} · Price $${(p.price||0).toFixed(2)}</div>
+      <div class="sub">Price $${(p.price||0).toFixed(2)}</div>
       ${meta.length ? `<div class="sub" style="color:var(--ink-secondary)">${meta.join(' · ')}</div>` : ''}
       <div class="actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">${actions.join('')}</div>
     </div>
@@ -3509,6 +3509,7 @@ function openPartEditModal(repairId, partId) {
     <div class="modal" style="max-height:90vh;overflow-y:auto">
       <h3>Edit part</h3>
       <div class="field"><label>Part name</label><input id="ep-name" value="${escapeHtml(p.name)}"/></div>
+      <div class="field" style="margin-top:8px"><label>Part number <span style="color:var(--ink-tertiary);font-weight:normal;font-size:11px">(for ordering — paste/type the SKU)</span></label><input id="ep-number" value="${escapeHtml(p.part_number || '')}" placeholder="e.g. TRA6851R"/></div>
       <div class="form-row" style="margin-top:8px">
         <div class="field"><label>Source</label>
           <select id="ep-src">
@@ -3519,10 +3520,7 @@ function openPartEditModal(repairId, partId) {
         </div>
         <div class="field"><label>Vendor</label><input id="ep-vendor" value="${escapeHtml(p.vendor||'')}"/></div>
       </div>
-      <div class="form-row" style="margin-top:8px">
-        <div class="field"><label>Cost</label><input id="ep-cost" type="number" step="0.01" value="${p.cost||''}"/></div>
-        <div class="field"><label>Customer price</label><input id="ep-price" type="number" step="0.01" value="${p.price||''}"/></div>
-      </div>
+      <div class="field" style="margin-top:8px"><label>Customer price</label><input id="ep-price" type="number" step="0.01" value="${p.price||''}"/></div>
       <div class="field" style="margin-top:8px"><label>Tracking number</label><input id="ep-tracking" value="${escapeHtml(p.tracking_number||'')}" placeholder="e.g. 1Z..."/></div>
       <div class="form-row" style="margin-top:8px">
         <div class="field"><label>Ordered date</label><input id="ep-ordered" type="date" value="${dateOrEmpty(p.ordered_date)}"/></div>
@@ -3547,9 +3545,9 @@ function openPartEditModal(repairId, partId) {
     const name = wrap.querySelector('#ep-name').value.trim();
     if (!name) { wrap.querySelector('#ep-name').focus(); return; }
     p2.name = name;
+    p2.part_number = wrap.querySelector('#ep-number').value.trim() || null;
     p2.source = wrap.querySelector('#ep-src').value;
     p2.vendor = wrap.querySelector('#ep-vendor').value.trim() || null;
-    p2.cost = parseFloat(wrap.querySelector('#ep-cost').value) || 0;
     p2.price = parseFloat(wrap.querySelector('#ep-price').value) || 0;
     p2.tracking_number = wrap.querySelector('#ep-tracking').value.trim() || null;
     p2.ordered_date  = wrap.querySelector('#ep-ordered').value  || null;
@@ -3568,7 +3566,8 @@ function openPartModal(repairId) {
   wrap.innerHTML = `
     <div class="modal">
       <h3>Add part</h3>
-      <div class="field"><label>Part name</label><input id="pname" placeholder="e.g. Traxxas 6851R differential"/></div>
+      <div class="field"><label>Part name</label><input id="pname" placeholder="e.g. Differential"/></div>
+      <div class="field" style="margin-top:8px"><label>Part number <span style="color:var(--ink-tertiary);font-weight:normal;font-size:11px">(for ordering — paste/type the SKU)</span></label><input id="pnumber" placeholder="e.g. TRA6851R"/></div>
       <div class="form-row" style="margin-top:8px">
         <div class="field"><label>Source</label>
           <select id="psrc">
@@ -3579,10 +3578,7 @@ function openPartModal(repairId) {
         </div>
         <div class="field"><label>Vendor</label><input id="pvendor" placeholder="e.g. Horizon"/></div>
       </div>
-      <div class="form-row" style="margin-top:8px">
-        <div class="field"><label>Cost</label><input id="pcost" type="number" step="0.01" placeholder="0.00"/></div>
-        <div class="field"><label>Customer price</label><input id="pprice" type="number" step="0.01" placeholder="0.00"/></div>
-      </div>
+      <div class="field" style="margin-top:8px"><label>Customer price</label><input id="pprice" type="number" step="0.01" placeholder="0.00"/></div>
       <div class="form-row" style="margin-top:8px">
         <div class="field"><label>Ordered date <span style="color:var(--ink-tertiary);font-weight:normal;font-size:11px">(drives the 8-day overdue alert)</span></label><input id="pordered" type="date"/></div>
         <div class="field"><label>Expected delivery (optional)</label><input id="pexpected" type="date"/></div>
@@ -3608,9 +3604,9 @@ function openPartModal(repairId) {
     if (!name) { wrap.querySelector('#pname').focus(); return; }
     db.parts.push({
       id: uid(), repair_id: repairId, name,
+      part_number: wrap.querySelector('#pnumber').value.trim() || null,
       source: wrap.querySelector('#psrc').value,
       vendor: wrap.querySelector('#pvendor').value.trim() || null,
-      cost: parseFloat(wrap.querySelector('#pcost').value) || 0,
       price: parseFloat(wrap.querySelector('#pprice').value) || 0,
       ordered_date: wrap.querySelector('#pordered').value || null,
       received_date: null, installed_date: null,
