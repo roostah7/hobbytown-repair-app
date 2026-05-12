@@ -2547,17 +2547,19 @@ function renderDetail(id) {
             ${(sessionsForRepair.length || labor.length) ? `
               <div style="font-size:12px;text-transform:uppercase;letter-spacing:0.06em;color:var(--gray);margin-bottom:6px">Time logged</div>
               ${sessionsForRepair.map(n => `
-                <div class="kv" style="display:flex;justify-content:space-between">
-                  <div class="k" style="margin:0">${formatRelativeDay(n.session_started_at || n.created_at)} · ${escapeHtml(n.author_name)} · timer</div>
-                  <div class="v" style="font-variant-numeric:tabular-nums">${fmtMin(n.session_raw_minutes || 0)}</div>
+                <div class="kv" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                  <div class="k" style="margin:0;flex:1;min-width:0">${formatRelativeDay(n.session_started_at || n.created_at)} · ${escapeHtml(n.author_name)} · timer</div>
+                  <div class="v" style="font-variant-numeric:tabular-nums;white-space:nowrap">${fmtMin(n.session_raw_minutes || 0)}</div>
+                  <div style="display:flex;gap:4px"><button class="btn small secondary" data-edit-session="${n.id}" title="Edit session" style="padding:4px 8px;font-size:11px">✎</button><button class="btn small secondary" data-del-session="${n.id}" title="Remove session" style="padding:4px 8px;font-size:11px;color:var(--signal-danger);border-color:var(--signal-danger)">×</button></div>
                 </div>
               `).join('')}
               ${labor.map(l => {
                 const techStr = l.tech_name ? l.tech_name : (r.assigned_tech || 'Manual');
                 return `
-                <div class="kv" style="display:flex;justify-content:space-between">
-                  <div class="k" style="margin:0">${l.logged_at} · ${escapeHtml(techStr)} · manual${l.description ? ' · ' + escapeHtml(l.description) : ''}</div>
-                  <div class="v" style="font-variant-numeric:tabular-nums">${fmtMin(Math.round((l.hours||0)*60))}</div>
+                <div class="kv" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                  <div class="k" style="margin:0;flex:1;min-width:0">${l.logged_at} · ${escapeHtml(techStr)} · manual${l.description ? ' · ' + escapeHtml(l.description) : ''}</div>
+                  <div class="v" style="font-variant-numeric:tabular-nums;white-space:nowrap">${fmtMin(Math.round((l.hours||0)*60))}</div>
+                  <div style="display:flex;gap:4px"><button class="btn small secondary" data-edit-labor="${l.id}" title="Edit entry" style="padding:4px 8px;font-size:11px">✎</button><button class="btn small secondary" data-del-labor="${l.id}" title="Remove entry" style="padding:4px 8px;font-size:11px;color:var(--signal-danger);border-color:var(--signal-danger)">×</button></div>
                 </div>`;
               }).join('')}
             ` : '<div class="empty">No labor logged yet — start a timer above to track.</div>'}
@@ -2697,12 +2699,89 @@ function renderDetail(id) {
   };
   document.getElementById('addPart').onclick  = () => openPartModal(id);
   document.getElementById('addLabor').onclick = () => openLaborModal(id);
+
+  // Edit / remove manual labor entries
+  document.querySelectorAll('[data-edit-labor]').forEach(el => {
+    el.onclick = () => openLaborEditModal(id, el.dataset.editLabor);
+  });
+  document.querySelectorAll('[data-del-labor]').forEach(el => {
+    el.onclick = () => {
+      const lid = el.dataset.delLabor;
+      const db = loadDB();
+      const l = db.labor.find(x => x.id === lid);
+      if (!l) return;
+      if (!confirm(`Remove this labor entry?\n\n${l.description || '(no description)'} — ${(l.hours||0)} hours\n\nThis will reduce the labor charge on the bill.`)) return;
+      db.labor = db.labor.filter(x => x.id !== lid);
+      saveDB(db);
+      if (SUPABASE_ENABLED && sb) sb.from('labor_entries').delete().eq('id', lid).then(({ error }) => { if (error) console.error('Delete labor failed:', error); });
+      renderDetail(id);
+    };
+  });
+  // Edit / remove timer sessions (stored as notes with note_type='work_session')
+  document.querySelectorAll('[data-edit-session]').forEach(el => {
+    el.onclick = () => openSessionEditModal(id, el.dataset.editSession);
+  });
+  document.querySelectorAll('[data-del-session]').forEach(el => {
+    el.onclick = () => {
+      const nid = el.dataset.delSession;
+      const db = loadDB();
+      const n = db.notes.find(x => x.id === nid);
+      if (!n) return;
+      if (!confirm(`Remove this timer session?\n\n${n.author_name || ''} · ${n.session_raw_minutes || 0} min\n\nThis will reduce the labor charge on the bill.`)) return;
+      db.notes = db.notes.filter(x => x.id !== nid);
+      saveDB(db);
+      if (SUPABASE_ENABLED && sb) sb.from('notes').delete().eq('id', nid).then(({ error }) => { if (error) console.error('Delete session failed:', error); });
+      renderDetail(id);
+    };
+  });
+  document.querySelectorAll('[data-mark-ordered]').forEach(el => {
+    el.onclick = () => {
+      const db = loadDB();
+      const p = db.parts.find(x => x.id === el.dataset.markOrdered);
+      p.ordered_date = todayISO();
+      // Auto-advance status from 'intake'/'diag' to 'parts' when first part gets ordered
+      const rr = db.repairs.find(x => x.id === id);
+      if (rr && (rr.status === 'intake' || rr.status === 'diag')) {
+        rr.status = 'parts';
+        db.notes.push({ id: uid(), repair_id: id, note_type: 'internal', body: `Status auto-advanced to Awaiting Parts (first part marked ordered).`, author_name: currentUser().name, created_at: nowISO() });
+      }
+      saveDB(db); renderDetail(id);
+    };
+  });
   document.querySelectorAll('[data-mark-received]').forEach(el => {
     el.onclick = () => {
       const db = loadDB();
       const p = db.parts.find(x => x.id === el.dataset.markReceived);
       p.received_date = todayISO();
       saveDB(db); renderDetail(id);
+    };
+  });
+  document.querySelectorAll('[data-mark-installed]').forEach(el => {
+    el.onclick = () => {
+      const db = loadDB();
+      const p = db.parts.find(x => x.id === el.dataset.markInstalled);
+      p.installed_date = todayISO();
+      saveDB(db); renderDetail(id);
+    };
+  });
+  document.querySelectorAll('[data-edit-part]').forEach(el => {
+    el.onclick = () => openPartEditModal(id, el.dataset.editPart);
+  });
+  document.querySelectorAll('[data-del-part]').forEach(el => {
+    el.onclick = async () => {
+      const pid = el.dataset.delPart;
+      const db = loadDB();
+      const p = db.parts.find(x => x.id === pid);
+      if (!p) return;
+      if (!confirm(`Remove "${p.name}" from this repair?\n\nThis can't be undone (but you can re-add it).`)) return;
+      // Remove from cache
+      db.parts = db.parts.filter(x => x.id !== pid);
+      saveDB(db);
+      // Also delete on server (saveDB upserts but doesn't delete; do it explicitly)
+      if (SUPABASE_ENABLED && sb) {
+        sb.from('parts').delete().eq('id', pid).then(({ error }) => { if (error) console.error('Delete part failed:', error); });
+      }
+      renderDetail(id);
     };
   });
 
@@ -3323,6 +3402,34 @@ function renderTimerPanel(db, r) {
 function partCard(p) {
   const overdue = partOverdue(p);
   const sourceLabel = { customer_supplied: 'Customer-supplied', shop_stock: 'Shop stock', special_order: 'Special order' }[p.source];
+
+  // State badge — installed > received > ordered (overdue indicator) > needed
+  let badge;
+  if (p.installed_date) badge = `<span class="badge ready">✓ Installed ${p.installed_date}</span>`;
+  else if (p.received_date) badge = `<span class="badge parts">Received ${p.received_date}</span>`;
+  else if (overdue) badge = `<span class="badge alert">⚠ Ordered ${overdue} days ago</span>`;
+  else if (p.ordered_date) badge = `<span class="badge parts">Ordered ${p.ordered_date}</span>`;
+  else badge = `<span class="badge intake">Needed</span>`;
+
+  // Action buttons — depend on lifecycle state
+  const actions = [];
+  if (!p.ordered_date && !p.installed_date) {
+    actions.push(`<button class="btn small" data-mark-ordered="${p.id}">Mark ordered</button>`);
+  }
+  if (p.ordered_date && !p.received_date) {
+    actions.push(`<button class="btn small" data-mark-received="${p.id}">Mark received</button>`);
+  }
+  if (p.received_date && !p.installed_date) {
+    actions.push(`<button class="btn small" data-mark-installed="${p.id}">Mark installed</button>`);
+  }
+  actions.push(`<button class="btn small secondary" data-edit-part="${p.id}">Edit</button>`);
+  actions.push(`<button class="btn small secondary" data-del-part="${p.id}" style="color:var(--signal-danger);border-color:var(--signal-danger)">Remove</button>`);
+
+  // Tracking + expected info shown inline when relevant
+  const meta = [];
+  if (p.tracking_number) meta.push(`Tracking: ${escapeHtml(p.tracking_number)}`);
+  if (p.expected_date && !p.received_date) meta.push(`Expected: ${p.expected_date}`);
+
   return `
     <div class="part">
       <div class="top">
@@ -3330,13 +3437,11 @@ function partCard(p) {
           <div class="name">${escapeHtml(p.name)}</div>
           <div class="sub">${sourceLabel}${p.vendor ? ' · ' + escapeHtml(p.vendor) : ''}</div>
         </div>
-        ${overdue ? `<span class="badge alert">⚠ ${overdue} days</span>` :
-          p.received_date ? `<span class="badge ready">Received ${p.received_date}</span>` :
-          p.ordered_date ? `<span class="badge parts">Ordered ${p.ordered_date}</span>` :
-          `<span class="badge intake">Needed</span>`}
+        ${badge}
       </div>
       <div class="sub">Cost $${(p.cost||0).toFixed(2)} · Price $${(p.price||0).toFixed(2)}</div>
-      ${!p.received_date && p.ordered_date ? `<div class="actions"><button class="btn small secondary" data-mark-received="${p.id}">Mark received</button></div>` : ''}
+      ${meta.length ? `<div class="sub" style="color:var(--ink-secondary)">${meta.join(' · ')}</div>` : ''}
+      <div class="actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">${actions.join('')}</div>
     </div>
   `;
 }
@@ -3393,6 +3498,70 @@ function openNoteModal(repairId, defaultType) {
     saveDB(db); wrap.remove(); renderDetail(repairId);
   };
 }
+function openPartEditModal(repairId, partId) {
+  const db = loadDB();
+  const p = db.parts.find(x => x.id === partId);
+  if (!p) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-wrap';
+  const dateOrEmpty = (d) => d || '';
+  wrap.innerHTML = `
+    <div class="modal" style="max-height:90vh;overflow-y:auto">
+      <h3>Edit part</h3>
+      <div class="field"><label>Part name</label><input id="ep-name" value="${escapeHtml(p.name)}"/></div>
+      <div class="form-row" style="margin-top:8px">
+        <div class="field"><label>Source</label>
+          <select id="ep-src">
+            <option value="special_order" ${p.source==='special_order'?'selected':''}>Special order</option>
+            <option value="customer_supplied" ${p.source==='customer_supplied'?'selected':''}>Customer-supplied</option>
+            <option value="shop_stock" ${p.source==='shop_stock'?'selected':''}>Shop stock</option>
+          </select>
+        </div>
+        <div class="field"><label>Vendor</label><input id="ep-vendor" value="${escapeHtml(p.vendor||'')}"/></div>
+      </div>
+      <div class="form-row" style="margin-top:8px">
+        <div class="field"><label>Cost</label><input id="ep-cost" type="number" step="0.01" value="${p.cost||''}"/></div>
+        <div class="field"><label>Customer price</label><input id="ep-price" type="number" step="0.01" value="${p.price||''}"/></div>
+      </div>
+      <div class="field" style="margin-top:8px"><label>Tracking number</label><input id="ep-tracking" value="${escapeHtml(p.tracking_number||'')}" placeholder="e.g. 1Z..."/></div>
+      <div class="form-row" style="margin-top:8px">
+        <div class="field"><label>Ordered date</label><input id="ep-ordered" type="date" value="${dateOrEmpty(p.ordered_date)}"/></div>
+        <div class="field"><label>Expected delivery</label><input id="ep-expected" type="date" value="${dateOrEmpty(p.expected_date)}"/></div>
+      </div>
+      <div class="form-row" style="margin-top:8px">
+        <div class="field"><label>Received date</label><input id="ep-received" type="date" value="${dateOrEmpty(p.received_date)}"/></div>
+        <div class="field"><label>Installed date</label><input id="ep-installed" type="date" value="${dateOrEmpty(p.installed_date)}"/></div>
+      </div>
+      <div class="form-actions">
+        <button class="btn secondary" id="ep-cancel">Cancel</button>
+        <button class="btn" id="ep-save">Save changes</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  attachModalBehavior(wrap);
+  wrap.querySelector('#ep-cancel').onclick = () => wrap.remove();
+  wrap.querySelector('#ep-save').onclick = () => {
+    const db2 = loadDB();
+    const p2 = db2.parts.find(x => x.id === partId);
+    if (!p2) { wrap.remove(); return; }
+    const name = wrap.querySelector('#ep-name').value.trim();
+    if (!name) { wrap.querySelector('#ep-name').focus(); return; }
+    p2.name = name;
+    p2.source = wrap.querySelector('#ep-src').value;
+    p2.vendor = wrap.querySelector('#ep-vendor').value.trim() || null;
+    p2.cost = parseFloat(wrap.querySelector('#ep-cost').value) || 0;
+    p2.price = parseFloat(wrap.querySelector('#ep-price').value) || 0;
+    p2.tracking_number = wrap.querySelector('#ep-tracking').value.trim() || null;
+    p2.ordered_date  = wrap.querySelector('#ep-ordered').value  || null;
+    p2.expected_date = wrap.querySelector('#ep-expected').value || null;
+    p2.received_date = wrap.querySelector('#ep-received').value || null;
+    p2.installed_date= wrap.querySelector('#ep-installed').value|| null;
+    saveDB(db2);
+    wrap.remove();
+    renderDetail(repairId);
+  };
+}
+
 function openPartModal(repairId) {
   const wrap = document.createElement('div');
   wrap.className = 'modal-wrap';
@@ -3414,8 +3583,13 @@ function openPartModal(repairId) {
         <div class="field"><label>Cost</label><input id="pcost" type="number" step="0.01" placeholder="0.00"/></div>
         <div class="field"><label>Customer price</label><input id="pprice" type="number" step="0.01" placeholder="0.00"/></div>
       </div>
-      <div class="checkbox-row" style="margin-top:6px">
-        <label><input type="checkbox" id="markOrdered" checked> Mark as ordered today</label>
+      <div class="form-row" style="margin-top:8px">
+        <div class="field"><label>Ordered date <span style="color:var(--ink-tertiary);font-weight:normal;font-size:11px">(drives the 8-day overdue alert)</span></label><input id="pordered" type="date"/></div>
+        <div class="field"><label>Expected delivery (optional)</label><input id="pexpected" type="date"/></div>
+      </div>
+      <div class="field" style="margin-top:8px"><label>Tracking number (optional)</label><input id="ptracking" placeholder="e.g. 1Z..."/></div>
+      <div class="checkbox-row" style="margin-top:6px;font-size:12px;color:var(--ink-tertiary)">
+        Leave Ordered date blank if not yet ordered (shows as "Needed" — click Mark ordered later)
       </div>
       <div class="form-actions">
         <button class="btn secondary" id="cancel">Cancel</button>
@@ -3425,6 +3599,8 @@ function openPartModal(repairId) {
   `;
   document.body.appendChild(wrap);
   attachModalBehavior(wrap);
+  // Default ordered date to today — staff can clear it if part isn't ordered yet
+  wrap.querySelector('#pordered').value = todayISO();
   wrap.querySelector('#cancel').onclick = () => wrap.remove();
   wrap.querySelector('#save').onclick = () => {
     const db = loadDB();
@@ -3436,12 +3612,87 @@ function openPartModal(repairId) {
       vendor: wrap.querySelector('#pvendor').value.trim() || null,
       cost: parseFloat(wrap.querySelector('#pcost').value) || 0,
       price: parseFloat(wrap.querySelector('#pprice').value) || 0,
-      ordered_date: wrap.querySelector('#markOrdered').checked ? todayISO() : null,
-      received_date: null, installed_date: null, tracking_number: null,
+      ordered_date: wrap.querySelector('#pordered').value || null,
+      received_date: null, installed_date: null,
+      tracking_number: wrap.querySelector('#ptracking').value.trim() || null,
+      expected_date: wrap.querySelector('#pexpected').value || null,
     });
     saveDB(db); wrap.remove(); renderDetail(repairId);
   };
 }
+function openLaborEditModal(repairId, laborId) {
+  const db = loadDB();
+  const l = db.labor.find(x => x.id === laborId);
+  if (!l) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-wrap';
+  wrap.innerHTML = `
+    <div class="modal">
+      <h3>Edit labor entry</h3>
+      <div class="sub">Adjust hours, description, or date if a mistake was made.</div>
+      <div class="field"><label>Description</label><input id="el-desc" value="${escapeHtml(l.description || '')}"/></div>
+      <div class="form-row" style="margin-top:8px">
+        <div class="field"><label>Hours</label><input id="el-hours" type="number" step="0.25" value="${l.hours || 0}"/></div>
+        <div class="field"><label>Rate ($/hr)</label><input id="el-rate" type="number" step="0.01" value="${l.rate || 60}"/></div>
+      </div>
+      <div class="field" style="margin-top:8px"><label>Logged on</label><input id="el-date" type="date" value="${l.logged_at || todayISO()}"/></div>
+      <div class="form-actions">
+        <button class="btn secondary" id="el-cancel">Cancel</button>
+        <button class="btn" id="el-save">Save changes</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  attachModalBehavior(wrap);
+  wrap.querySelector('#el-cancel').onclick = () => wrap.remove();
+  wrap.querySelector('#el-save').onclick = () => {
+    const db2 = loadDB();
+    const l2 = db2.labor.find(x => x.id === laborId);
+    if (!l2) { wrap.remove(); return; }
+    l2.description = wrap.querySelector('#el-desc').value.trim() || null;
+    l2.hours = parseFloat(wrap.querySelector('#el-hours').value) || 0;
+    l2.rate = parseFloat(wrap.querySelector('#el-rate').value) || 60;
+    l2.logged_at = wrap.querySelector('#el-date').value || todayISO();
+    saveDB(db2);
+    wrap.remove();
+    renderDetail(repairId);
+  };
+}
+
+function openSessionEditModal(repairId, noteId) {
+  const db = loadDB();
+  const n = db.notes.find(x => x.id === noteId);
+  if (!n || n.note_type !== 'work_session') return;
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-wrap';
+  const startTime = n.session_started_at ? new Date(n.session_started_at).toLocaleString() : '(unknown)';
+  const stopTime  = n.session_stopped_at ? new Date(n.session_stopped_at).toLocaleString() : '(unknown)';
+  wrap.innerHTML = `
+    <div class="modal">
+      <h3>Edit timer session</h3>
+      <div class="sub">${escapeHtml(n.author_name || '')} · Started ${startTime} · Stopped ${stopTime}</div>
+      <div class="field" style="margin-top:12px"><label>Minutes worked <span style="color:var(--ink-tertiary);font-weight:normal;font-size:11px">(adjust if the timer ran too long)</span></label><input id="es-mins" type="number" step="1" value="${n.session_raw_minutes || 0}"/></div>
+      <div class="field" style="margin-top:8px"><label>Notes (optional)</label><input id="es-body" value="${escapeHtml(n.body || '')}"/></div>
+      <div class="form-actions">
+        <button class="btn secondary" id="es-cancel">Cancel</button>
+        <button class="btn" id="es-save">Save changes</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  attachModalBehavior(wrap);
+  wrap.querySelector('#es-cancel').onclick = () => wrap.remove();
+  wrap.querySelector('#es-save').onclick = () => {
+    const db2 = loadDB();
+    const n2 = db2.notes.find(x => x.id === noteId);
+    if (!n2) { wrap.remove(); return; }
+    const mins = Math.max(0, parseInt(wrap.querySelector('#es-mins').value, 10) || 0);
+    n2.session_raw_minutes = mins;
+    n2.body = wrap.querySelector('#es-body').value.trim() || n2.body;
+    saveDB(db2);
+    wrap.remove();
+    renderDetail(repairId);
+  };
+}
+
 function openLaborModal(repairId) {
   const wrap = document.createElement('div');
   wrap.className = 'modal-wrap';
