@@ -3155,13 +3155,15 @@ async function refreshCurrentUserFromSupabase() {
   const { data: { user } } = await sb.auth.getUser();
   if (!user) { setUser(null); return null; }
   // Look up staff_profiles to get role + full name. If not in staff_profiles → not authorized.
-  const { data: profile, error } = await sb.from('staff_profiles').select('user_id, full_name, role, is_active').eq('user_id', user.id).maybeSingle();
-  if (error) { console.error('staff_profiles lookup failed:', error); }
+  // Use SECURITY DEFINER RPC so RLS can't accidentally block self-lookup
+  const { data: rows, error } = await sb.rpc('get_my_profile');
+  if (error) { console.error('get_my_profile RPC failed:', error); }
+  const profile = (rows && rows.length) ? rows[0] : null;
   if (!profile || !profile.is_active) {
+    console.warn('Profile lookup result:', { user_id: user.id, profile, error });
     setUser(null);
-    // Sign them out — they authenticated but aren't an active staff member
     await sb.auth.signOut();
-    setTimeout(() => alert('Your email isn\'t set up as active staff yet. Ask the shop owner to add you.'), 100);
+    setTimeout(() => alert('Your email isn\'t set up as active staff yet. Ask the shop owner to add you.\n\n(user.id = ' + user.id + ')'), 100);
     return null;
   }
   setUser({ id: user.id, email: user.email, name: profile.full_name, role: profile.role });
