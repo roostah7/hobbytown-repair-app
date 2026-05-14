@@ -2464,7 +2464,8 @@ function renderDetail(id) {
         <div>
           ${renderTimerPanel(db, r)}
           <div class="panel panel-issue" style="margin-top:14px">
-            <h3>Item & issue</h3>
+            <h3>Item & issue <span class="actions"><button class="btn small secondary" id="editDetails">✎ Edit details</button></span></h3>
+            <div class="kv"><div class="k">Customer</div><div class="v">${escapeHtml(c.name || '(no name)')}${c.email ? ' · ' + escapeHtml(c.email) : ''}</div></div>
             <div class="kv"><div class="k">Item</div><div class="v">${escapeHtml(r.item_description || '(not entered)')}</div></div>
             <div class="checkrow">
               <span class="check">${r.transmitter_included ? '<span class="y">✓</span>' : '<span class="n">✗</span>'} Transmitter</span>
@@ -2472,6 +2473,7 @@ function renderDetail(id) {
               <span class="check">${r.charger_included ? '<span class="y">✓</span>' : '<span class="n">✗</span>'} Charger</span>
             </div>
             <div class="kv"><div class="k">Issue</div><div class="v">${escapeHtml(r.issue_description || '(not entered)')}</div></div>
+            ${r.updated_at ? `<div class="sub" style="margin-top:8px;font-size:11px;color:var(--ink-tertiary)">Last updated ${formatRelativeDateTime(r.updated_at)}</div>` : ''}
             ${(r.policy_signed_name || r.policy_signature_image) ? `
               <div class="kv" style="margin-top:var(--s-3);padding-top:var(--s-3);border-top:1px dashed var(--line-soft)">
                 <div class="k">Repair policy signed</div>
@@ -2699,6 +2701,8 @@ function renderDetail(id) {
   };
   document.getElementById('addPart').onclick  = () => openPartModal(id);
   document.getElementById('addLabor').onclick = () => openLaborModal(id);
+  const editDetailsBtn = document.getElementById('editDetails');
+  if (editDetailsBtn) editDetailsBtn.onclick = () => openEditDetailsModal(id);
 
   // Edit / remove manual labor entries
   document.querySelectorAll('[data-edit-labor]').forEach(el => {
@@ -3616,6 +3620,80 @@ function openPartModal(repairId) {
     saveDB(db); wrap.remove(); renderDetail(repairId);
   };
 }
+function openEditDetailsModal(repairId) {
+  const db = loadDB();
+  const r = db.repairs.find(x => x.id === repairId);
+  if (!r) return;
+  const c = db.customers.find(x => x.id === r.customer_id) || {};
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-wrap';
+  wrap.innerHTML = `
+    <div class="modal" style="max-height:90vh;overflow-y:auto;max-width:560px">
+      <h3>Edit repair details</h3>
+      <div class="sub">Fix typos, add the customer's email, update the issue description, etc.</div>
+
+      <div class="form-section" style="margin-top:var(--s-4)">
+        <h4 style="margin:0 0 var(--s-2);font-size:13px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-secondary)">Customer</h4>
+        <div class="field"><label>Name</label><input id="ed-name" value="${escapeHtml(c.name || '')}"/></div>
+        <div class="form-row" style="margin-top:8px">
+          <div class="field"><label>Phone</label><input id="ed-phone" value="${escapeHtml(c.phone ? formatPhone(c.phone) : '')}"/></div>
+          <div class="field"><label>Email</label><input id="ed-email" type="email" value="${escapeHtml(c.email || '')}"/></div>
+        </div>
+        <div class="sub" style="margin-top:6px;font-size:11px;color:var(--ink-tertiary)">Changes to the customer record apply to ALL their repairs.</div>
+      </div>
+
+      <div class="form-section" style="margin-top:var(--s-4)">
+        <h4 style="margin:0 0 var(--s-2);font-size:13px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-secondary)">Item</h4>
+        <div class="field"><label>Description</label><input id="ed-item" value="${escapeHtml(r.item_description || '')}" placeholder="e.g. Traxxas Slash 4x4 — blue"/></div>
+        <div class="checkbox-row" style="margin-top:8px;display:flex;gap:var(--s-4);flex-wrap:wrap">
+          <label><input type="checkbox" id="ed-trans" ${r.transmitter_included ? 'checked' : ''}> Transmitter included</label>
+          <label><input type="checkbox" id="ed-batt" ${r.battery_included ? 'checked' : ''}> Battery included</label>
+          <label><input type="checkbox" id="ed-charge" ${r.charger_included ? 'checked' : ''}> Charger included</label>
+        </div>
+      </div>
+
+      <div class="form-section" style="margin-top:var(--s-4)">
+        <h4 style="margin:0 0 var(--s-2);font-size:13px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-secondary)">Issue</h4>
+        <div class="field"><label>Description</label><textarea id="ed-issue" rows="4" style="width:100%;padding:10px;border:1px solid var(--line-soft);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--ink-primary);box-sizing:border-box;resize:vertical;font-family:inherit;font-size:14px">${escapeHtml(r.issue_description || '')}</textarea></div>
+      </div>
+
+      <div class="form-actions" style="margin-top:var(--s-4)">
+        <button class="btn secondary" id="ed-cancel">Cancel</button>
+        <button class="btn" id="ed-save">Save changes</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  attachModalBehavior(wrap);
+  wrap.querySelector('#ed-cancel').onclick = () => wrap.remove();
+  wrap.querySelector('#ed-save').onclick = () => {
+    const db2 = loadDB();
+    const r2 = db2.repairs.find(x => x.id === repairId);
+    if (!r2) { wrap.remove(); return; }
+    const c2 = db2.customers.find(x => x.id === r2.customer_id);
+    let phoneDigits = wrap.querySelector('#ed-phone').value.replace(/\D/g, '');
+    if (phoneDigits.length === 11 && phoneDigits.startsWith('1')) phoneDigits = phoneDigits.slice(1);
+
+    if (c2) {
+      c2.name = wrap.querySelector('#ed-name').value.trim() || null;
+      c2.phone = phoneDigits || null;
+      c2.email = wrap.querySelector('#ed-email').value.trim() || null;
+    }
+    r2.item_description = wrap.querySelector('#ed-item').value.trim() || null;
+    r2.issue_description = wrap.querySelector('#ed-issue').value.trim() || null;
+    r2.transmitter_included = wrap.querySelector('#ed-trans').checked;
+    r2.battery_included = wrap.querySelector('#ed-batt').checked;
+    r2.charger_included = wrap.querySelector('#ed-charge').checked;
+    db2.notes.push({
+      id: uid(), repair_id: repairId, note_type: 'internal',
+      body: `Repair details edited by ${currentUser().name}.`,
+      author_name: currentUser().name, created_at: nowISO(),
+    });
+    saveDB(db2);
+    wrap.remove();
+    renderDetail(repairId);
+  };
+}
+
 function openLaborEditModal(repairId, laborId) {
   const db = loadDB();
   const l = db.labor.find(x => x.id === laborId);
